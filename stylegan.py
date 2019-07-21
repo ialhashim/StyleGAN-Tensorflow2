@@ -229,6 +229,28 @@ def Blur(name, blur_filter=[1,2,1]):
         return _blur2d(x, f, normalize)
     return Lambda(lambda x: blur2d(x, blur_filter), name=name)
 
+def _downscale2d(x, factor=2, gain=1):
+    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert isinstance(factor, int) and factor >= 1
+
+    # 2x2, float32 => downscale using _blur2d().
+    if factor == 2 and x.dtype == tf.float32:
+        f = [np.sqrt(gain) / factor] * factor
+        return _blur2d(x, f=f, normalize=False, stride=factor)
+
+    # Apply gain.
+    if gain != 1:
+        x *= gain
+
+    # No-op => early exit.
+    if factor == 1:
+        return x
+
+    # Large factor => downscale using tf.nn.avg_pool().
+    # NOTE: Requires tf_config['graph_options.place_pruned_graph']=True to work.
+    ksize = [1, 1, factor, factor]
+    return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')
+
 def _upscale2d(x, factor=2, gain=1):
     assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
@@ -247,10 +269,30 @@ def _upscale2d(x, factor=2, gain=1):
     x = tf.tile(x, [1, 1, 1, factor, 1, factor])
     x = tf.reshape(x, [-1, s[1], s[2] * factor, s[3] * factor])
     return x
-
+	
+def Downscaled2d(name, factor=2, gain=1):
+    return Lambda(lambda x: _downscale2d(x, factor, gain), name=name+'/Downscaled2d')
+	
 def Upscaled2d(name, factor=2, gain=1):
     return Lambda(lambda x: _upscale2d(x, factor, gain), name=name+'/Upscaled2d')
 
+def Conv2d_downscale2d(model, filters, kernel_size, name, gain=math.sqrt(2), fused_scale='auto'):
+    if fused_scale == 'auto':
+        x = model.layers[-1].output
+        fused_scale = min(x.shape[2:]) >= 128
+        
+    if not fused_scale:
+        # Not fused => call the individual ops directly.
+        model.add( Conv2d(filters, kernel_size, name, gain) )
+        model.add( Downscaled2d(name) )        
+    else:
+        # Fused => perform both ops simultaneously using tf.nn.conv2d().
+        def fused_op(w):
+            w = tf.pad(w, [[1,1], [1,1], [0,0], [0,0]], mode='CONSTANT')
+            w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]]) * 0.25
+            return w
+        model.add( Conv2d(filters, kernel_size, name, gain, kernel_modifier=fused_op, strides=2) )
+		
 def Upscale2d_conv2d(x, filters, kernel_size, name, use_bias, gain=math.sqrt(2), fused_scale='auto'):
     if fused_scale == 'auto':
         fused_scale = min(x.shape[2:]) * 2 >= 128
@@ -291,6 +333,21 @@ class Conv2d_transpose(Conv2DTranspose):
         
         return outputs
 
+def minibatch_stddev_layer(x, group_size=4, num_new_features=1):
+    with tf.variable_scope('MinibatchStddev'):
+        group_size = tf.minimum(group_size, tf.shape(x)[0])     # Minibatch must be divisible by (or smaller than) group_size.
+        s = x.shape                                             # [NCHW]  Input shape.
+        y = tf.reshape(x, [group_size, -1, num_new_features, s[1]//num_new_features, s[2], s[3]])   # [GMncHW] Split minibatch into M groups of size G. Split channels into n channel groups c.
+        y = tf.cast(y, tf.float32)                              # [GMncHW] Cast to FP32.
+        y -= tf.reduce_mean(y, axis=0, keepdims=True)           # [GMncHW] Subtract mean over group.
+        y = tf.reduce_mean(tf.square(y), axis=0)                # [MncHW]  Calc variance over group.
+        y = tf.sqrt(y + 1e-8)                                   # [MncHW]  Calc stddev over group.
+        y = tf.reduce_mean(y, axis=[2,3,4], keepdims=True)      # [Mn111]  Take average over fmaps and pixels.
+        y = tf.reduce_mean(y, axis=[2])                         # [Mn11] Split channels into c channel groups
+        y = tf.cast(y, x.dtype)                                 # [Mn11]  Cast back to original data type.
+        y = tf.tile(y, [group_size, 1, s[2], s[3]])             # [NnHW]  Replicate over group and pixels.
+        return tf.concat([x, y], axis=1)                        # [NCHW]  Append as new fmap.
+		
 def StyleGAN_G_mapping( latent_size=512, dlatent_size=512, mapping_layers=8, mapping_fmaps=512, mapping_lrmul=0.01 ):
     model = Sequential(name='G_mapping')
     model.add( InputLayer(input_shape=[latent_size], name='G_mapping/latents_in') ) 
@@ -387,12 +444,7 @@ class StyleGAN_G(Model):
         x = self.model_synthesis(x)
         return x
     
-    def set_weights_from_memory(self, all_weights):
-        self.copy_weights_to_keras_model(self.model_mapping, all_weights)
-        self.copy_weights_to_keras_model(self.model_synthesis, all_weights)
-        print('All weights loaded to model.')
-        
-    def generate_sample(self, seed=5):
+    def generate_sample(self, seed=5, is_visualize=False):
         rnd = np.random.RandomState(seed)
         latents = rnd.randn(1, 512)
 
@@ -400,71 +452,122 @@ class StyleGAN_G(Model):
 
         images = y.transpose([0, 2, 3, 1])
         images = np.clip((images+1)*0.5, 0, 1)
-        print(images.shape, np.min(images), np.max(images))
         
-        import matplotlib.pyplot as plt
+        if is_visualize:
+            print(images.shape, np.min(images), np.max(images))
+
+            import matplotlib.pyplot as plt
+
+            plt.figure(figsize=(10,10))
+            plt.imshow(images[0])
+            plt.show()
         
-        plt.figure(figsize=(10,10))
-        plt.imshow(images[0])
-        plt.show()
+        return images
     
-    def copy_weights_to_keras_model(self, model, all_weights):
-        c = 0
-        od = all_weights
-        for l in model.layers:
-            values = l.get_weights()
-            weights = list(map(lambda x: x.shape, values))
-            if not len(weights): continue
+class StyleGAN_D(Model):
+    def __init__(self, resolution=1024, mbstd_group_size=4, mbstd_num_features=1):
+        super(StyleGAN_D, self).__init__()
 
-            num_params = values[0].size
+        resolution_log2 = int(math.log2(resolution))
 
-            # Special weights
-            if len(weights) == 1:    
-                weights_list = []
+        model = Sequential(name='Discriminator')
+        model.add(InputLayer(input_shape=[3, resolution, resolution])) 
 
-                # The learned constant variable
-                if l.name == 'G_synthesis/4x4/Const': weights_list.append( od[l.name+'/const'] )
+        def fromrgb(res):
+            name = 'FromRGB_lod%d' % (resolution_log2 - res)
+            model.add( Conv2d(filters=nf(res-1), kernel_size=1, name=name) )
+            model.add( LeakyReLU(alpha=0.2, name=name+'/LeakyReLU') )
 
-                # Truncation trick variable
-                if 'Truncation' in l.name: weights_list.append( od['dlatent_avg'] )
+        def block(res):
+            name = '%dx%d' % (2**res, 2**res)
+            if res >= 3: # 8x8 and up
+                model.add( Conv2d(filters=nf(res-1), kernel_size=3, name=name+'/Conv0') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv0/LeakyReLU') )
 
-                # Input noise
-                if 'G_synthesis/noise' in l.name: weights_list.append( od[l.name] ) 
+                model.add( Blur(name=name+'/Blur') )
+                Conv2d_downscale2d(model=model, filters=nf(res-2), kernel_size=3, name=name+'/Conv1_down')
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv1_down/LeakyReLU') )
 
-                # Noise variables
-                if 'Noise' in l.name: weights_list.append( od[l.name+'/weight'] )
+            else: # 4x4
+                if mbstd_group_size > 1: 
+                    model.add( Lambda(lambda x: minibatch_stddev_layer(x, mbstd_group_size, mbstd_num_features), name=name+'/MinibatchStddev') )
 
-                # Bias variables
-                if 'bias' in l.name: weights_list.append( od[l.name] )
+                model.add( Conv2d(filters=nf(res-1), kernel_size=3, name=name+'/Conv') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Conv/LeakyReLU') )
 
-                # Conv with no bias
-                if l.name.endswith('Conv') or l.name.endswith('Conv1') or l.name.endswith('Conv0_up'):
-                    weights_list.append( od[l.name+'/weight'] )
+                model.add( Flatten() )
+                model.add( DenseLayer(units=nf(res-2), kernel_initializer=GetWeights(), name=name+'/Dense0') )
+                model.add( LeakyReLU(alpha=0.2, name=name+'/Dense0/LeakyReLU') )
 
-                if len(weights_list) > 0:
-                    l.set_weights( weights_list )
-                    print('.', end='')
-                    c = c + num_params
-                else:
-                    print('WARNING: weights not found for ', l.name, '  of size', weights[0])
-            else:  
-            # Standard weights (weight + bias)
-                assert len(weights) == 2
+                model.add( DenseLayer(units=1, kernel_initializer=GetWeights(1), gain=1, name=name+'/Dense1') )   
 
-                num_params = num_params + values[1].size
+        # Blocks
+        fromrgb(resolution_log2)
+        for res in range(resolution_log2, 2, -1): block(res)
+        block(2)
 
-                layer_name = l.name
-                var_names = ['{}/{}'.format(layer_name, 'weight'), '{}/{}'.format(layer_name, 'bias')]
+        self.model = model
 
-                if var_names[0] in od and var_names[1] in od:
-                    weight = od[var_names[0]]
-                    bias = od[var_names[1]]
+    def call(self, inputs):
+        return self.model(inputs)
 
-                    l.set_weights( [ weight, bias ] )
+def copy_weights_to_keras_model(model, all_weights):
+    c = 0
+    od = all_weights
+    for l in model.layers:
+        values = l.get_weights()
+        weights = list(map(lambda x: x.shape, values))
+        if not len(weights): continue
 
-                    print('.', end='')
-                    c = c + num_params
-                else:
-                    print('WARNING: not found', var_names)
+        num_params = values[0].size
 
-        print('Total number of parameters copied:', c)
+        # Special weights
+        if len(weights) == 1:    
+            weights_list = []
+
+            # The learned constant variable
+            if l.name == 'G_synthesis/4x4/Const': weights_list.append( od[l.name+'/const'] )
+
+            # Truncation trick variable
+            if 'Truncation' in l.name: weights_list.append( od['dlatent_avg'] )
+
+            # Input noise
+            if 'G_synthesis/noise' in l.name: weights_list.append( od[l.name] ) 
+
+            # Noise variables
+            if 'Noise' in l.name: weights_list.append( od[l.name+'/weight'] )
+
+            # Bias variables
+            if 'bias' in l.name: weights_list.append( od[l.name] )
+
+            # Conv with no bias
+            if l.name.endswith('Conv') or l.name.endswith('Conv1') or l.name.endswith('Conv0_up'):
+                weights_list.append( od[l.name+'/weight'] )
+
+            if len(weights_list) > 0:
+                l.set_weights( weights_list )
+                print('.', end='')
+                c = c + num_params
+            else:
+                print('WARNING: weights not found for ', l.name, '  of size', weights[0])
+        else:  
+        # Standard weights (weight + bias)
+            assert len(weights) == 2
+
+            num_params = num_params + values[1].size
+
+            layer_name = l.name
+            var_names = ['{}/{}'.format(layer_name, 'weight'), '{}/{}'.format(layer_name, 'bias')]
+
+            if var_names[0] in od and var_names[1] in od:
+                weight = od[var_names[0]]
+                bias = od[var_names[1]]
+
+                l.set_weights( [ weight, bias ] )
+
+                print('.', end='')
+                c = c + num_params
+            else:
+                print('WARNING: not found', var_names)
+
+    print('Total number of parameters copied:', c)
