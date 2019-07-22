@@ -1,5 +1,5 @@
 # StyleGAN Tensorflow 2.0
-This is an unofficial TensorFlow 2.0 implementation of the paper:
+This is an unofficial TensorFlow 2.0 implementation of the paper with full compatibility with the orignal code:
 
 > **A Style-Based Generator Architecture for Generative Adversarial Networks**<br>
 > Tero Karras (NVIDIA), Samuli Laine (NVIDIA), Timo Aila (NVIDIA)<br>
