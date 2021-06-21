@@ -31,7 +31,7 @@ def runtime_coef(kernel_size, gain, fmaps_in, fmaps_out, lrmul=1.0):
 
 def pixel_norm(x, epsilon=1e-8):
     epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
-    return x * tf.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
+    return x * tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=1, keepdims=True) + epsilon)
 
 class PixelNorm(Layer):
     def __init__(self, name):
@@ -50,7 +50,7 @@ class InstanceNorm(Layer):
         x = tf.cast(x, tf.float32)
         x -= tf.reduce_mean(x, axis=[2,3], keepdims=True)
         epsilon = tf.constant(epsilon, dtype=x.dtype, name='epsilon')
-        x *= tf.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
+        x *= tf.math.rsqrt(tf.reduce_mean(tf.square(x), axis=[2,3], keepdims=True) + epsilon)
         x = tf.cast(x, orig_dtype)
         return x
     
@@ -70,7 +70,7 @@ class Truncation(Layer):
         self.truncation_cutoff = truncation_cutoff
 
     def build(self, input_shape):
-        self.dlatent_avg = self.add_variable('dlatent_avg', shape=[int(input_shape[-1])])
+        self.dlatent_avg = self.add_weight('dlatent_avg', shape=[input_shape[-1]])
 
     def call(self, inputs):
         layer_idx = np.arange(self.num_layers)[np.newaxis, :, np.newaxis]
@@ -88,10 +88,10 @@ class DenseLayer(Dense):
         self.lrmul = lrmul
     
     def call(self, inputs):
-        x, b, w = inputs, self.bias * self.lrmul, self.kernel * runtime_coef([1,1], self.gain, inputs.shape[1].value, self.units, lrmul=self.lrmul)
+        x, b, w = inputs, self.bias * self.lrmul, self.kernel * runtime_coef([1,1], self.gain, inputs.shape[1], self.units, lrmul=self.lrmul)
         
         # Input x kernel
-        if len(x.shape) > 2: x = tf.reshape(x, [-1, np.prod([d.value for d in x.shape[1:]])])
+        if len(x.shape) > 2: x = tf.reshape(x, [-1, np.prod([d for d in x.shape[1:]])])
         x = tf.matmul(x, w)
         
         # Bias
@@ -115,7 +115,7 @@ class Conv2d(Conv2D):
         else:
             w = self.kernel_modifier(self.kernel)
             
-        outputs = self._convolution_op(inputs, w * runtime_coef(self.kernel_size, self.gain, inputs.shape[1].value, self.filters))
+        outputs = self._convolution_op(inputs, w * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters))
         
         if self.use_bias:
             b = self.bias * self.lrmul        
@@ -131,7 +131,7 @@ class Const(Layer):
         super(Const, self).__init__(name=name)
         
     def build(self, input_shape):
-        self.const = self.add_variable('const', shape=[1,512,4,4])
+        self.const = self.add_weight('const', shape=[1,512,4,4])
         
     def call(self, inputs):
         return tf.tile(self.const, [tf.shape(inputs)[0], 1, 1, 1])
@@ -145,7 +145,7 @@ class RandomNoise(Layer):
         self.noise_shape = [1, 1, 2**res, 2**res]
     
     def build(self, input_shape):
-        self.noise = self.add_variable('noise', shape=self.noise_shape, initializer=tf.initializers.zeros(), trainable=False)
+        self.noise = self.add_weight('noise', shape=self.noise_shape, initializer=tf.initializers.zeros(), trainable=False)
         
     def call(self, inputs):
         return self.noise
@@ -156,7 +156,7 @@ class ApplyNoise(Layer):
 
     def build(self, input_shape):
         input_shape = input_shape[0]
-        self.weight = self.add_variable('weight', shape=[input_shape[1].value], initializer=tf.initializers.zeros())
+        self.weight = self.add_weight('weight', shape=[input_shape[1]], initializer=tf.initializers.zeros())
         
     def call(self, inputs):        
         #noise = tf.random_normal([tf.shape(x)[0], 1, x.shape[2], x.shape[3]], dtype=x.dtype)
@@ -170,7 +170,7 @@ class ApplyBias(Layer):
         self.lrmul = lrmul
         
     def build(self, input_shape):
-        self.bias = self.add_variable('bias', shape=[input_shape[1].value])
+        self.bias = self.add_weight('bias', shape=[input_shape[1]])
         
     def call(self, x):
         b = self.bias * self.lrmul
@@ -196,7 +196,7 @@ class StyleModApply(Layer):
         return x * (style[:,0] + 1) + style[:,1]
 
 def _blur2d(x, f=[1,2,1], normalize=True, flip=False, stride=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(stride, int) and stride >= 1
 
     # Finalize filter kernel.
@@ -230,7 +230,7 @@ def Blur(name, blur_filter=[1,2,1]):
     return Lambda(lambda x: blur2d(x, blur_filter), name=name)
 
 def _downscale2d(x, factor=2, gain=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
 
     # 2x2, float32 => downscale using _blur2d().
@@ -252,7 +252,7 @@ def _downscale2d(x, factor=2, gain=1):
     return tf.nn.avg_pool(x, ksize=ksize, strides=ksize, padding='VALID', data_format='NCHW')
 
 def _upscale2d(x, factor=2, gain=1):
-    assert x.shape.ndims == 4 and all(dim.value is not None for dim in x.shape[1:])
+    assert x.shape.ndims == 4 and all(dim is not None for dim in x.shape[1:])
     assert isinstance(factor, int) and factor >= 1
 
     # Apply gain.
@@ -314,8 +314,8 @@ class Conv2d_transpose(Conv2DTranspose):
         self.kernel_modifier = kernel_modifier
         
     def build(self, input_shape):
-        shape = [self.kernel_size[0], self.kernel_size[1], input_shape[1].value, self.filters]
-        self.kernel = self.add_variable('weight', shape=shape, initializer=tf.initializers.zeros())
+        shape = [self.kernel_size[0], self.kernel_size[1], input_shape[1], self.filters]
+        self.kernel = self.add_weight('weight', shape=shape, initializer=tf.initializers.zeros())
             
     def call(self, inputs):
         # Fused => perform both ops simultaneously using tf.nn.conv2d_transpose().
@@ -325,7 +325,7 @@ class Conv2d_transpose(Conv2DTranspose):
             w = tf.add_n([w[1:, 1:], w[:-1, 1:], w[1:, :-1], w[:-1, :-1]])
             return w
 
-        x, w = inputs, fused_op(self.kernel * runtime_coef(self.kernel_size, self.gain, inputs.shape[1].value, self.filters, lrmul=self.lrmul))
+        x, w = inputs, fused_op(self.kernel * runtime_coef(self.kernel_size, self.gain, inputs.shape[1], self.filters, lrmul=self.lrmul))
         
         os = [tf.shape(inputs)[0], self.filters, inputs.shape[2] * 2, inputs.shape[3] * 2]
         
